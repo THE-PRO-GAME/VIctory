@@ -198,14 +198,15 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let Some(&number) = committed.last() else {
         return Ok(None);
     };
-    for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
-    }
     let version = dir.join(format!("v{number}"));
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
     let mut names = parse_manifest(&std::fs::read(version.join(MANIFEST))?).ok_or_else(bad)?;
     let blobs = names.split_off(2);
     let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
+    // Keep older versions if the newest manifest cannot be read.
+    for old in &committed[..committed.len() - 1] {
+        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+    }
     Ok(Some(Version {
         dir: version,
         number,
@@ -1179,6 +1180,30 @@ mod tests {
         assert!(c.dir.join("v1").is_dir(), "the committed save was removed");
         assert!(backup.is_dir());
         assert_eq!(blobs.unwrap(), [("blob".into(), b"data".to_vec())]);
+    }
+
+    #[test]
+    fn recovery_retains_the_previous_version_if_the_latest_manifest_is_invalid() {
+        let root = tempfile::tempdir().unwrap();
+        let c = Provider {
+            root: root.path().to_owned(),
+        }
+        .container("Slot");
+        commit(&c.dir, 1, "Slot", "", &[("blob", Source::Data(b"first"))]).unwrap();
+        commit(&c.dir, 2, "Slot", "", &[("blob", Source::Data(b"second"))]).unwrap();
+        let latest_manifest = c.dir.join("v2").join(MANIFEST);
+        let original = std::fs::read(&latest_manifest).unwrap();
+        std::fs::write(&latest_manifest, b"invalid").unwrap();
+
+        assert!(read(&c, None).is_err());
+        assert_eq!(std::fs::read(c.dir.join("v1").join("0")).unwrap(), b"first");
+
+        std::fs::write(&latest_manifest, original).unwrap();
+        assert_eq!(
+            read(&c, None).unwrap(),
+            [("blob".into(), b"second".to_vec())]
+        );
+        assert!(!c.dir.join("v1").exists());
     }
 
     /// An empty configuration id names none. As a folder name it would be
