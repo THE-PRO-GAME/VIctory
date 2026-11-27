@@ -672,12 +672,12 @@ impl<'a> Lanes<'a> {
             // EXEC where known in this block (read or written so far).
             let mut now = None;
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
-                if inst.read(Reg::S(EXEC)).is_some() {
-                    let e = self.exec(inst);
+                let read_exec = self.read_exec(inst);
+                if let Some(e) = read_exec {
                     execs[b][i] = Some(e);
                     now = Some(e);
                 }
-                self.step(inst, now);
+                self.step(inst, now, read_exec);
                 if let Some(k) = self.key(|r| inst.write(r), EXEC) {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
                 }
@@ -892,11 +892,18 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    fn read_exec(&mut self, inst: &Inst) -> Option<Bool> {
+        let lo = inst.read(Reg::S(EXEC))?;
+        let hi = if self.p.wave64 {
+            inst.read(Reg::S(EXEC + 1))
+        } else {
+            Some(lo)
+        };
+        Some(hi.map_or(Bool::TRUE, |hi| self.mask((lo, hi)).0))
+    }
+
     fn exec(&mut self, inst: &Inst) -> Bool {
-        match self.key(|r| inst.read(r), EXEC) {
-            Some(k) => self.mask(k).0,
-            None => Bool::TRUE,
-        }
+        self.read_exec(inst).unwrap_or(Bool::TRUE)
     }
 
     /// The mask a value pair holds, and whether it derives from EXEC or a
@@ -1190,8 +1197,9 @@ impl<'a> Lanes<'a> {
         })
     }
 
-    /// Records the masks `inst` defines; `exec` is EXEC there, if known.
-    fn step(&mut self, inst: &Inst, exec: Option<Bool>) {
+    /// Records the masks `inst` defines, with the last known EXEC and the
+    /// mask read by this instruction, if any.
+    fn step(&mut self, inst: &Inst, exec: Option<Bool>, read_exec: Option<Bool>) {
         let name = inst.name();
         match &inst.fields {
             Fields::Sop { src, .. } => {
@@ -1265,7 +1273,7 @@ impl<'a> Lanes<'a> {
                 }
             }
             Fields::Valu(v) => {
-                let exec = self.exec(inst);
+                let exec = read_exec.unwrap_or(Bool::TRUE);
                 let lane = |l: &mut Self, k: Key| {
                     let born = l.born(k.0);
                     let a = l.b.atom(Atom::Lane(k.0), born);
