@@ -5,6 +5,10 @@
 
 use std::collections::HashSet;
 
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+};
+
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
@@ -241,7 +245,7 @@ fn some_lane_of_a_mask_is_a_number_the_whole_wave_agrees_on() {
         0x8002_0200, // buffer_store_dword v2, off, s[8:11], 0
     ]);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let shader = on_64_lanes(&native, &p);
+    let Some(shader) = on_supported_lanes(&native, &p, &HashSet::new()) else { return };
     // (lane s0 waits, if there is one; s1 rounds)
     for (wait, rounds, done) in [(0, 0, 0), (37, 4, 0), (63, 4, 0), (64, 0, 1), (37, 5, 1), (64, 9, 1)] {
         let Some(out) = dispatched(&shader, &[wait, rounds]) else {
@@ -249,6 +253,34 @@ fn some_lane_of_a_mask_is_a_number_the_whole_wave_agrees_on() {
         };
         assert_eq!(out, done, "lane {wait} after {rounds} rounds");
     }
+}
+
+/// Build the native or split-wave form the test adapter can actually run.
+fn on_supported_lanes(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Option<HostShader> {
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(error) => {
+            eprintln!("no SM 6.6 hardware device: {error}; not run");
+            return None;
+        }
+    };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the matching writable options struct for this feature query.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    }.expect("wave capabilities");
+    eprintln!("host wave lanes {}..={}", options.WaveLaneCountMin, options.WaveLaneCountMax);
+    if options.WaveLaneCountMax >= 64 && options.WaveLaneCountMin <= 64 {
+        return Some(on_64_lanes(native, p));
+    }
+    if options.WaveLaneCountMin == 32 && options.WaveLaneCountMax == 32 {
+        return Some(lowered(native, p, wide).expect("exact split-wave lowering"));
+    }
+    None
 }
 
 /// `native` for a host of 64-lane waves.
@@ -289,21 +321,14 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
     shader
 }
 
-/// Dword 0 of the UAV after `shader` ran with root constants `constants`; none without a
-/// device that takes it.
+/// Dword 0 of the UAV after a shader built for this device's wave size runs.
 fn dispatched(shader: &HostShader, constants: &[u32]) -> Option<u32> {
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(host) = Host::new(false) else {
         eprintln!("no SM 6.6 hardware device; not run");
         return None;
     };
-    let (root, pso) = match host.compute_pipeline(shader) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("the hardware device does not take this program (waves of 64?): {e}; not run");
-            return None;
-        }
-    };
+    let (root, pso) = host.compute_pipeline(shader).expect("pipeline on a compatible wave size");
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
         if u.root == RootType::Constants {
@@ -349,7 +374,7 @@ fn a_sum_of_halves_where_not_every_lane_runs_on_a_wave_of_64() {
     ]);
     let native = native(&words);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let shader = on_64_lanes(&native, &p);
+    let Some(shader) = on_supported_lanes(&native, &p, &HashSet::from([0])) else { return };
     let wide = |h: u16| match h {
         0 => 0.0,
         h => f32::from_bits((u32::from(h >> 10) + 112) << 23 | u32::from(h & 0x3FF) << 13),
@@ -401,7 +426,7 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
     words[1] = 0xBF88_0000 | (words.len() as u32 - 2);
     let native = native(&words);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let shader = lowered_on(&native, &p, &HashSet::new(), 64).expect("lower");
+    let Some(shader) = on_supported_lanes(&native, &p, &HashSet::from([0])) else { return };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
@@ -423,8 +448,6 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
         (h + u32::from(rest > 0x1000 || rest == 0x1000 && h & 1 == 1)) as u16
     };
     let add = |a: u16, b: u16| narrow(wide(a) + wide(b));
-    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut ran = false;
     for stay in [64u32, 63, 40, 33, 32, 17, 5, 1] {
         let terms: Vec<u16> = (0..64u32)
             .map(|t| if t < stay { (0x3C00 + 37 * t) as u16 } else { 0 })
@@ -433,16 +456,13 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
         while tree.len() > 1 {
             tree = tree.chunks(2).map(|c| add(c[0], c[1])).collect();
         }
-        let Some(got) = on_the_card(&shader, [stay, 0]) else {
+        let Some(got) = dispatched(&shader, &[stay, 0]) else {
             return;
         };
-        ran = true;
         // (the high half is lane 0's term's: zero)
         assert_eq!(got, u32::from(tree[0]), "{stay} lanes stay: got {got:#x}, the console's tree {:#x}", tree[0]);
     }
-    if ran {
-        eprintln!("ran on the hardware device: the console's tree with lanes gone, in every case");
-    }
+    eprintln!("ran on the hardware device: the console's tree with lanes gone, in every case");
 }
 
 /// One `v_add_f16` whose exact result lies between two halves: 1 + 3/1024 (0x3C03) plus 2
