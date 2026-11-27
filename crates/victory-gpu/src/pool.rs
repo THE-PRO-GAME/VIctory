@@ -10,12 +10,9 @@
 //! forty seconds of a world without its textures.
 //! `VICTORY_TEXTURE_POOL=0` makes every one an allocation of its own again.
 //!
-//! A piece given back is used again only two seconds later (nothing the card
-//! was told before that is still running: Windows resets a card that takes
-//! that long over one submission), and by then no list names it (the owners' rule, as for allocations of their own): a
-//! texture's piece comes back when the last reference to the host texture
-//! goes (an object of ours the texture holds says so), a staging buffer's
-//! when the last list that recorded its copy is reset.
+//! Placed texture pieces rest before reuse because shaders can address them
+//! through descriptors. Upload pieces are copy sources: their owners keep
+//! them until all command lists that name them are discarded or finish.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
@@ -70,7 +67,7 @@ fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     }
 }
 
-/// Milliseconds until a piece given back is used again. (It was three
+/// Milliseconds until a placed texture piece given back is used again. (It was three
 /// frames, a tenth of a second while the title shows a loading screen at 30
 /// a second, with up to 18 submissions in the air.)
 const REST: u64 = 2500;
@@ -302,6 +299,12 @@ impl<B: Clone> Pool<B> {
         self.resting.push_back((now + REST, piece));
     }
 
+    fn release(&mut self, piece: Piece) -> bool {
+        let block = self.blocks[piece.block].as_mut().expect("block with a live piece");
+        block.free.give(piece.start, piece.len);
+        block.free.whole(BLOCK)
+    }
+
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
     fn rested(&mut self, now: u64) {
@@ -314,10 +317,7 @@ impl<B: Clone> Pool<B> {
             && ready <= now
         {
             self.resting.pop_front();
-            if let Some(block) = self.blocks[piece.block].as_mut() {
-                block.free.give(piece.start, piece.len);
-                any |= block.free.whole(BLOCK);
-            }
+            any |= self.release(piece);
         }
         // (Without a piece given back too, once there is less room.)
         let most = limit.min(self.most);
@@ -368,12 +368,13 @@ pub(crate) fn memory() -> [u64; 2] {
     [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
 }
 
-/// Part of a block of mapped upload memory, back in the pool when dropped.
+/// Part of a block of mapped upload memory. Its owner must keep it until
+/// every recorded copy that reads it has completed or been discarded.
 pub(crate) struct StagingPiece(Piece);
 
 impl Drop for StagingPiece {
     fn drop(&mut self) {
-        lock(&STAGING).give(self.0, now());
+        lock(&STAGING).release(self.0);
     }
 }
 
@@ -785,6 +786,18 @@ mod tests {
     }
 
     #[test]
+    fn a_completed_upload_can_reuse_its_range_at_the_same_tick() {
+        let mut pool = Pool::new(STAGING_KEPT);
+        let (first, _, _) = pool.take(4096, 512, 0, || Some(1)).unwrap();
+        let (live, _, _) = pool.take(4096, 512, 0, || None).unwrap();
+        assert_ne!(live.start, first.start);
+        assert!(!pool.release(first));
+        let (reused, _, again) = pool.take(4096, 512, 0, || None).unwrap();
+        assert_eq!(reused, first);
+        assert!(again, "a recycled upload must still be cleared before use");
+    }
+
+    #[test]
     fn pieces_never_overlap_and_rest_before_they_are_used_again() {
         let mut pool: Pool<u32> = Pool::new(SPARE);
         let made = std::cell::Cell::new(0);
@@ -884,7 +897,6 @@ mod tests {
             assert!(at.is_multiple_of(512));
             std::ptr::write_bytes(data, 0xAB, 4096);
             drop(piece);
-            lock(&STAGING).rested(u64::MAX);
             let (_piece, _, _, data) = staging(host, 4096).unwrap();
             assert!((0..4096).all(|i| *data.add(i) == 0));
             // SAFETY: plain query.
