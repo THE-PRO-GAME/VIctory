@@ -551,7 +551,7 @@ impl Module {
 
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
-        w.bytes(b"BC\xC0\xDE");
+        w.bytes.extend_from_slice(b"BC\xC0\xDE");
         w.enter(MODULE_BLOCK, 3);
         w.record(1, &[1]); // VERSION: relative value ids
 
@@ -965,10 +965,10 @@ fn signed(v: i64) -> u64 {
 /// The bitstream: little-endian 32-bit words filled from bit 0.
 #[derive(Default)]
 struct Writer {
-    words: Vec<u32>,
+    bytes: Vec<u8>,
     cur: u64,
     bits: u32,
-    /// Per open block: abbreviation width, index of its length word.
+    /// Per open block: abbreviation width and byte offset of its first record.
     stack: Vec<(u32, usize)>,
 }
 
@@ -978,11 +978,11 @@ impl Writer {
     }
 
     fn emit(&mut self, v: u64, width: u32) {
-        debug_assert!(width == 64 || v >> width == 0);
+        debug_assert!(width <= 32 && v >> width == 0);
         self.cur |= v << self.bits;
         self.bits += width;
-        while self.bits >= 32 {
-            self.words.push(self.cur as u32);
+        if self.bits >= 32 {
+            self.bytes.extend_from_slice(&(self.cur as u32).to_le_bytes());
             self.cur >>= 32;
             self.bits -= 32;
         }
@@ -999,15 +999,9 @@ impl Writer {
 
     fn align(&mut self) {
         if self.bits > 0 {
-            self.words.push(self.cur as u32);
+            self.bytes.extend_from_slice(&(self.cur as u32).to_le_bytes());
             self.cur = 0;
             self.bits = 0;
-        }
-    }
-
-    fn bytes(&mut self, b: &[u8]) {
-        for &x in b {
-            self.emit(u64::from(x), 8);
         }
     }
 
@@ -1016,15 +1010,16 @@ impl Writer {
         self.vbr(id, 8);
         self.vbr(u64::from(width), 4);
         self.align();
-        self.words.push(0);
-        self.stack.push((width, self.words.len()));
+        self.bytes.extend_from_slice(&[0; 4]);
+        self.stack.push((width, self.bytes.len()));
     }
 
     fn exit(&mut self) {
         self.emit(0, self.width()); // END_BLOCK
         self.align();
         let (_, start) = self.stack.pop().expect("open block");
-        self.words[start - 1] = (self.words.len() - start) as u32;
+        let words = ((self.bytes.len() - start) / 4) as u32;
+        self.bytes[start - 4..start].copy_from_slice(&words.to_le_bytes());
     }
 
     /// An unabbreviated record.
@@ -1039,7 +1034,7 @@ impl Writer {
 
     fn finish(mut self) -> Vec<u8> {
         self.align();
-        self.words.iter().flat_map(|w| w.to_le_bytes()).collect()
+        self.bytes
     }
 }
 
