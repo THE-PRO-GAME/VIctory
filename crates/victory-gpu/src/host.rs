@@ -1053,6 +1053,92 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn indirect_budget_readback_follows_info_logging() {
+        struct Filter(tracing::Level);
+        impl tracing::Subscriber for Filter {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                *meta.level() <= self.0
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let Some(host) = super::host() else { return };
+        let list = host.new_list().expect("command list");
+        for (level, copy) in [
+            (tracing::Level::WARN, false),
+            (tracing::Level::INFO, true),
+            (tracing::Level::WARN, false),
+        ] {
+            let _ = host.log_messages();
+            tracing::subscriber::with_default(Filter(level), || {
+                list.budget().expect("budget address");
+            });
+            if !list.card_budget.get().is_some_and(Option::is_some) {
+                return; // The mapped fallback always needs its buffer.
+            }
+            assert_eq!(list.deferred().budget_readback, copy);
+            if copy {
+                assert!(list.budget.get().is_some_and(Option::is_some));
+            }
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(host.log_messages(), None);
+            list.reset();
+        }
+    }
+
+    /// Times the initialization and diagnostic copies of command-list
+    /// budgets without timing any shader or other upload.
+    #[test]
+    #[ignore = "synthetic hardware benchmark"]
+    fn indirect_budget_readback_cost() {
+        use std::time::Instant;
+
+        let host = super::host().expect("hardware device");
+        let lists: Vec<_> = (0..96).map(|_| host.new_list().expect("command list")).collect();
+        let refs: Vec<_> = lists.iter().collect();
+        for run in 0..33 {
+            let begin = Instant::now();
+            for list in &lists {
+                list.budget().expect("GPU budget address");
+                assert!(list.card_budget.get().is_some_and(Option::is_some));
+                list.close();
+            }
+            let record = begin.elapsed();
+            let begin = Instant::now();
+            host.execute(&refs);
+            let submit = begin.elapsed();
+            assert_eq!(host.log_messages(), None);
+            if run == 0 {
+                let mut count = 0;
+                let mut bytes = 0;
+                for list in &lists {
+                    if let Some(Some((resource, _))) = list.budget.get() {
+                        count += 1;
+                        // SAFETY: query for the live resource's description.
+                        bytes += unsafe {
+                            host.device.GetResourceAllocationInfo(0, &[resource.GetDesc()]).SizeInBytes
+                        };
+                    }
+                }
+                println!("budget allocation {count} {bytes}");
+            } else {
+                println!("budget frame {} {}", record.as_nanos(), submit.as_nanos());
+            }
+            for list in &lists {
+                list.reset();
+            }
+        }
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -2419,6 +2505,8 @@ struct Deferred {
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
+    /// This recording will copy diagnostic words from its GPU budget.
+    budget_readback: bool,
     /// The indirect scratch buffer (`HostList::indirect_args`, by its
     /// interface pointer) that a clamp in this recording left readable as
     /// indirect arguments; 0 if none. It stays readable until the next
@@ -7380,44 +7468,47 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
-            .budget
-            .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
-            })
-            .as_ref()?;
         let card = self.card_budget.get_or_init(|| self.make_card_budget()).as_ref();
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
+            // The GPU buffer enforces the budget independently. Its
+            // mapped counterpart is only required for the INFO counters.
+            // Without a GPU buffer the mapped budget still needs resetting.
+            if card.is_none() || tracing::event_enabled!(tracing::Level::INFO) {
+                let (_, data) = self
+                    .budget
+                    .get_or_init(|| {
+                        let (b, d) = host()?.shared_buffer(256)?;
+                        Some((b, d as usize))
+                    })
+                    .as_ref()?;
+                deferred.budget_readback = card.is_some();
+                let at = *data;
+                // SAFETY: the mapped words belong to this list. Submission
+                // reads the previous run's diagnostics, then clears them
+                // before the GPU next uses the mapping.
+                deferred.copies.push(Step::Host(Box::new(move || unsafe {
+                    let words = at as *mut u32;
+                    let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
+                    MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
+                    MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
+                    let (refused, biggest) = (words.add(3).read_volatile(), words.add(4).read_volatile());
+                    BUDGET_NOTES[0].fetch_add(u64::from(refused), Ordering::Relaxed);
+                    BUDGET_NOTES[1].fetch_max(u64::from(biggest), Ordering::Relaxed);
+                    for k in 0..5 {
+                        words.add(k).write_volatile(0);
+                    }
+                }), (0, 0)));
+            }
             deferred.budget_zeroed = true;
-            let at = *data;
-            // SAFETY: the list's own mapped words, written before it runs.
-            // The words after the budget hold what the clamp noted about the
-            // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all; the records refused, the
-            // largest cost; with the card's copy, as
-            // the list's end copied them here): taken, then zeroed.
-            let notes = Box::new(move || unsafe {
-                let words = at as *mut u32;
-                let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
-                MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
-                MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                let (refused, biggest) = (words.add(3).read_volatile(), words.add(4).read_volatile());
-                BUDGET_NOTES[0].fetch_add(u64::from(refused), Ordering::Relaxed);
-                BUDGET_NOTES[1].fetch_max(u64::from(biggest), Ordering::Relaxed);
-                for k in 0..5 {
-                    words.add(k).write_volatile(0);
-                }
-            });
-            deferred.copies.push(Step::Host(notes, (0, 0)));
             drop(deferred);
             if let Some(card) = card {
                 self.zero_card_budget(card);
             }
         }
+        let buffer = card.or_else(|| self.budget.get()?.as_ref().map(|(buffer, _)| buffer))?;
         // SAFETY: a live buffer.
-        Some(unsafe { card.unwrap_or(buffer).GetGPUVirtualAddress() })
+        Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
     /// The budget's words in the card's own memory ([`card_budget`]), if
@@ -7466,26 +7557,34 @@ impl HostList {
     /// of the budget: its notes on mesh records go to the mapped words
     /// (read at the next submission), and it goes back to common.
     fn card_budget_out(&self) {
-        if !self.deferred().budget_zeroed {
+        let (used, readback) = {
+            let deferred = self.deferred();
+            (deferred.budget_zeroed, deferred.budget_readback)
+        };
+        if !used {
             return;
         }
-        let (Some(Some(card)), Some(Some((mapped, _)))) =
-            (self.card_budget.get(), self.budget.get())
-        else {
+        let Some(Some(card)) = self.card_budget.get() else {
             return;
         };
+        let mapped = self.budget.get().and_then(Option::as_ref).filter(|_| readback);
         // SAFETY: an open list; both buffers are the list's own. The
         // mapped one is promoted from common to the copy destination.
         unsafe {
+            let before = if let Some((mapped, _)) = mapped {
+                self.list.ResourceBarrier(&[transition(
+                    card,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
+                D3D12_RESOURCE_STATE_COPY_SOURCE
+            } else {
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+            };
             self.list.ResourceBarrier(&[transition(
                 card,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
-            self.list.ResourceBarrier(&[transition(
-                card,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                before,
                 D3D12_RESOURCE_STATE_COMMON,
             )]);
         }
