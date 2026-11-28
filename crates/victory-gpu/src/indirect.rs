@@ -309,8 +309,6 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
 }
 
 fn make_with_rest(device: &ID3D12Device, source: &str, rest: u32) -> windows::core::Result<Clamp> {
-    #[cfg(feature = "diagnostics")]
-    let batched = source == batch::SOURCE;
     let source = &format!("#define WIDEST {}u\n#define REST {rest}\n{source}", widest(amd(device)));
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
@@ -3545,7 +3543,6 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
-        depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
         back: ID3D12Resource,
@@ -3892,7 +3889,6 @@ void work() {
                     heap_pairs,
                     tables,
                     targets,
-                    depth_written,
                     depth_tested,
                     stamps,
                     back,
