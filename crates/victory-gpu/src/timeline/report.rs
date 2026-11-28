@@ -901,6 +901,7 @@ mod tests {
     /// Real threads, real waits: what the wrappers record names who ended
     /// them, and the chain leads to the thread that worked.
     #[test]
+    #[inline(never)] // The assertion below requires this frame in captured stacks.
     fn real_waits_are_recorded_with_who_ended_them() {
         use super::super::{hooks, record, span};
         use std::sync::{Arc, Condvar, Mutex};
