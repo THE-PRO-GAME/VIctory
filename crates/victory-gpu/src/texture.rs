@@ -102,6 +102,8 @@ pub(crate) struct Staging {
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
+    /// A pooled upload reused without clearing, awaiting its first fill.
+    needs_initial_fill: bool,
     hash: Option<Digest>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
@@ -1441,16 +1443,22 @@ impl Staging {
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
-        let read = self.refresh_timed();
+        let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
+        let read = self.refresh_timed(&mut last);
+        if std::mem::take(&mut last.needs_initial_fill) {
+            // This first refresh did not write the subresource (for example,
+            // the title has no mapped pages yet). Upload zeros as before.
+            // SAFETY: the staging range is live and this is its first refresh.
+            unsafe { std::ptr::write_bytes(self.data, 0, self.bytes as usize) };
+        }
+        drop(last);
         REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         read
     }
 
-    fn refresh_timed(&self) -> usize {
+    fn refresh_timed(&self, last: &mut Last) -> usize {
         let size = self.read;
         let start = self.memory as usize;
-        let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
-        let last = &mut *last;
         let exact = self.exact.swap(false, std::sync::atomic::Ordering::Relaxed);
         let alone = self.once.load(std::sync::atomic::Ordering::Relaxed);
         if alone && !exact && last.hash.is_some() {
@@ -1465,7 +1473,7 @@ impl Staging {
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
+                self.detile(last, read);
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
@@ -1569,7 +1577,7 @@ impl Staging {
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
-                self.detile(read);
+                self.detile(last, read);
                 true
             });
             #[cfg(feature = "diagnostics")]
@@ -1595,7 +1603,7 @@ impl Staging {
                 }
                 last.hash = Some(hash);
                 found_blind(last);
-                self.detile(tiled);
+                self.detile(last, tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
@@ -1612,7 +1620,7 @@ impl Staging {
         }
         last.hash = Some(hash);
         found_blind(last);
-        self.detile(tiled);
+        self.detile(last, tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -1634,7 +1642,7 @@ impl Staging {
             let hash = digest(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
-                self.detile(read);
+                self.detile(last, read);
             }
             true
         });
@@ -1667,7 +1675,7 @@ impl Staging {
             let hash = digest(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
-                self.detile(read);
+                self.detile(last, read);
                 changed = true;
             }
             true
@@ -1700,7 +1708,7 @@ impl Staging {
             }
             if got != 0 {
                 last.hash = Some(digest(read));
-                self.detile(read);
+                self.detile(last, read);
             }
             got
         });
@@ -1717,7 +1725,7 @@ impl Staging {
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    fn detile(&self, last: &mut Last, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
@@ -1767,6 +1775,7 @@ impl Staging {
                 return;
             }
         }
+        last.needs_initial_fill = false;
     }
 }
 
@@ -2164,6 +2173,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
     let mut total = 0;
+    let mut row_size = 0;
     // SAFETY: outputs for `count` subresources.
     unsafe {
         host.device.GetCopyableFootprints(
@@ -2173,11 +2183,28 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             0,
             Some(footprints.as_mut_ptr()),
             Some(rows.as_mut_ptr()),
-            None,
+            (count == 1).then_some(&raw mut row_size),
             Some(&mut total),
         );
     }
-    let (piece, buffer, base, data) = match crate::pool::staging(host, total) {
+    // Fast path for a single subresource only. The layout walker validates
+    // all arguments before writing. With no padding these rows initialize
+    // the entire upload range.
+    let overwrite = !on_demand
+        && count == 1
+        && row_size != 0
+        && footprints[0].Offset == 0
+        && row_size == u64::from(footprints[0].Footprint.RowPitch)
+        && row_size
+            .checked_mul(u64::from(rows[0]))
+            .and_then(|pitch| pitch.checked_mul(u64::from(footprints[0].Footprint.Depth)))
+            == Some(total)
+        && layout.mips.get(first as usize).is_some_and(|mip| {
+            u64::from(mip.width) * u64::from(layout.desc.element_bytes) == row_size
+                && mip.height == rows[0]
+                && mip.depth == footprints[0].Footprint.Depth
+        });
+    let (piece, buffer, base, data) = match crate::pool::staging(host, total, overwrite) {
         Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
         None => {
             let speculative = PICKING.get().is_some() && !BAKING.get();
@@ -2200,6 +2227,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    let last = Last { needs_initial_fill: overwrite && piece.is_some(), ..Last::default() };
     let s = Arc::new(Staging {
         buffer,
         base,
@@ -2219,7 +2247,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         once: std::sync::atomic::AtomicBool::new(once() && !on_demand && PICKING.get().is_some()),
         bytes: total,
         memory,
-        last: Mutex::default(),
+        last: Mutex::new(last),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
@@ -2237,6 +2265,83 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn first_texture_refresh_initializes_recycled_upload_bytes() {
+        use super::*;
+        use std::sync::atomic::Ordering::Relaxed;
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows_sys::Win32::System::Memory::*;
+
+        let Some(host) = host() else { return };
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 64,
+            height: 16,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        }).unwrap();
+        let bytes = 4096;
+        let title: Vec<u8> = (0..layout.size).map(|i| (i ^ (i >> 8)) as u8).collect();
+        // SAFETY: the reservation is private and is never dereferenced.
+        let absent = unsafe { VirtualAlloc(std::ptr::null(), title.len(), MEM_RESERVE, PAGE_NOACCESS) }.cast::<u8>();
+        assert!(!absent.is_null());
+        for (memory, expected) in [(title.as_ptr(), &title[..bytes]), (absent.cast_const(), &[0; 4096])] {
+            let (piece, buffer, base, data) = crate::pool::staging(host, bytes as u64, true).unwrap();
+            // SAFETY: this test owns the mapped upload piece.
+            unsafe { data.write_bytes(0xa7, bytes) };
+            STAGED[0].fetch_add(1, Relaxed);
+            STAGED[1].fetch_add(bytes as u64, Relaxed);
+            let stage = Staging {
+                buffer,
+                base,
+                _piece: Some(piece),
+                #[cfg(feature = "diagnostics")]
+                size: bytes as u64,
+                data,
+                footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Width: 64,
+                        Height: 16,
+                        Depth: 1,
+                        RowPitch: 256,
+                        ..Default::default()
+                    },
+                }],
+                rows: vec![16],
+                layout: layout.clone(),
+                mips: 1,
+                first: 0,
+                level0: 0,
+                read: title.len(),
+                serial: 0,
+                holds: Arc::default(),
+                once: true.into(),
+                bytes: bytes as u64,
+                memory,
+                last: Mutex::new(Last { needs_initial_fill: true, ..Last::default() }),
+                dirty: true.into(),
+                uploaded: false.into(),
+                used: 0.into(),
+                expected: 0.into(),
+                on_demand: false,
+                detiled: 0.into(),
+                judged: Default::default(),
+                waiting: 0.into(),
+                exact: false.into(),
+            };
+            stage.refresh_now();
+            // SAFETY: the stage still owns the piece and no GPU work uses it.
+            assert_eq!(unsafe { std::slice::from_raw_parts(data, bytes) }, expected);
+        }
+        // SAFETY: this test owns the entire reservation.
+        assert_ne!(unsafe { VirtualFree(absent.cast(), 0, MEM_RELEASE) }, 0);
+    }
 
     /// Whether memory is all there is answered by the runtime's views of
     /// physical pages where they lie, and by Windows where none does.

@@ -523,9 +523,10 @@ impl Drop for StagingPiece {
     }
 }
 
-/// `bytes` of upload memory, all zeros: the buffer it lies in, where in
-/// that buffer, and its mapping. `None`: not pooled.
-pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8)> {
+/// `bytes` of upload memory: the block, offset and mapped address.
+/// Unless `overwrite` is set, recycled pieces are cleared here. An
+/// overwriting caller must initialize every byte the GPU can read.
+pub(crate) fn staging(host: &crate::host::Host, bytes: u64, overwrite: bool) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8)> {
     if !on() {
         return None;
     }
@@ -546,7 +547,7 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
-    if again {
+    if again && !overwrite {
         // What is not detiled into it (an unmapped texture) uploads zeros,
         // as from a buffer of its own.
         // SAFETY: the piece is ours alone.
@@ -1079,11 +1080,11 @@ mod tests {
         assert_eq!(resting(), before + 1);
         // SAFETY: the piece's mapping, 4096 bytes of it ours.
         unsafe {
-            let (piece, _, at, data) = staging(host, 4096).unwrap();
+            let (piece, _, at, data) = staging(host, 4096, false).unwrap();
             assert!(at.is_multiple_of(512));
             std::ptr::write_bytes(data, 0xAB, 4096);
             drop(piece);
-            let (_piece, _, _, data) = staging(host, 4096).unwrap();
+            let (_piece, _, _, data) = staging(host, 4096, false).unwrap();
             assert!((0..4096).all(|i| *data.add(i) == 0));
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());

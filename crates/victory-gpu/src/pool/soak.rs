@@ -3,6 +3,10 @@
 //! Set `VICTORY_SOAK_SECONDS` for duration, `VICTORY_SOAK_ALIASES` to
 //! `direct` or `through` for alias copies, or `VICTORY_SOAK_GPU_UPLOAD=1`
 //! to measure a mapped VRAM upload buffer.
+//! `VICTORY_SOAK_UNCAPPED=1` runs the same frames without pacing.
+//! `VICTORY_SOAK_OVERWRITE=1` skips zeroing staging that the producer
+//! fills completely. `VICTORY_SOAK_SPLIT=1` also measures submitting
+//! half the uploads while the CPU prepares the rest.
 
 use std::time::{Duration, Instant};
 
@@ -127,8 +131,12 @@ fn streaming_render_soak() {
         .unwrap_or(90u64);
     let aliases = std::env::var("VICTORY_SOAK_ALIASES").unwrap_or_default();
     assert!(matches!(aliases.as_str(), "" | "direct" | "through"));
+    let uncapped = std::env::var_os("VICTORY_SOAK_UNCAPPED").is_some();
+    let overwrite = std::env::var_os("VICTORY_SOAK_OVERWRITE").is_some();
+    let split = std::env::var_os("VICTORY_SOAK_SPLIT").is_some();
     let host = host().expect("D3D12 device");
     let gpu_upload = std::env::var("VICTORY_SOAK_GPU_UPLOAD").is_ok_and(|value| value == "1");
+    assert!(!split || (overwrite && aliases.is_empty() && !gpu_upload));
     println!("GPU_UPLOAD supported={}", host.mapped_card_memory());
     let mapped = gpu_upload.then(|| {
         host.mapped_card_buffer(UPLOAD * u64::from(VIEWS), false)
@@ -183,6 +191,15 @@ fn streaming_render_soak() {
         let list: ID3D12GraphicsCommandList = device
             .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, &pso)
             .unwrap();
+        let prefix = split.then(|| {
+            let allocator: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .unwrap();
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .unwrap();
+            (allocator, list)
+        });
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
         let event = CreateEventW(None, false, false, None).unwrap();
         let mut stamps: Option<ID3D12QueryHeap> = None;
@@ -306,8 +323,16 @@ fn streaming_render_soak() {
             let first = ((frame * u64::from(VIEWS)) % u64::from(RESIDENT)) as u32;
             let value = |i: u32| ((frame.wrapping_mul(13) + u64::from(i) * 11) % 251) as u8;
             let mut staging = Vec::with_capacity(VIEWS as usize);
-            list.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            let first_list = prefix.as_ref().map_or(&list, |(_, list)| list);
+            first_list.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            let visible = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            let copying = D3D12_RESOURCE_STATE_COPY_DEST;
             for i in 0..VIEWS {
+                if i == VIEWS / 2 && let Some((_, prefix)) = &prefix {
+                    prefix.Close().unwrap();
+                    queue.ExecuteCommandLists(&[Some(prefix.cast().unwrap())]);
+                }
+                let list = if i < VIEWS / 2 { first_list } else { &list };
                 let tex = &materials[(first + i) as usize];
                 let source = sources.get(i as usize);
                 let (upload_target, state) = source.map_or(
@@ -318,16 +343,12 @@ fn streaming_render_soak() {
                     let offset = UPLOAD * u64::from(i);
                     (buffer, offset, data.add(offset as usize))
                 } else {
-                    staging.push(super::staging(host, UPLOAD).expect("staging allocation"));
+                    staging.push(super::staging(host, UPLOAD, overwrite).expect("staging allocation"));
                     let (_, buffer, offset, data) = staging.last().unwrap();
                     (buffer, *offset, *data)
                 };
                 std::ptr::write_bytes(data, value(i), UPLOAD as usize);
-                list.ResourceBarrier(&[transition(
-                    upload_target,
-                    state,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                )]);
+                list.ResourceBarrier(&[transition(upload_target, state, copying)]);
                 let mut layout = footprint(buffer, offset, [SIDE, SIDE, SIDE * 4]);
                 if let Some(source) = source {
                     layout.Anonymous.PlacedFootprint.Footprint.Format = source.GetDesc().Format;
@@ -348,11 +369,7 @@ fn streaming_render_soak() {
                     ]);
                     copies[(first + i) as usize].record(&list, source, tex);
                 }
-                list.ResourceBarrier(&[transition(
-                    tex,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                )]);
+                list.ResourceBarrier(&[transition(tex, copying, visible)]);
             }
             list.SetGraphicsRootSignature(&root);
             list.SetDescriptorHeaps(&[Some(srv_heap.clone())]);
@@ -411,6 +428,10 @@ fn streaming_render_soak() {
                 / frequency;
             allocator.Reset().unwrap();
             list.Reset(&allocator, &pso).unwrap();
+            if let Some((allocator, list)) = &prefix {
+                allocator.Reset().unwrap();
+                list.Reset(allocator, None).unwrap();
+            }
             drop(staging);
 
             if verify {
@@ -453,7 +474,9 @@ fn streaming_render_soak() {
                 assert_eq!(host.log_messages(), None);
             }
             frame += 1;
-            std::thread::sleep(FRAME.saturating_sub(start.elapsed()));
+            if !uncapped {
+                std::thread::sleep(FRAME.saturating_sub(start.elapsed()));
+            }
         }
         let third = times.len() / 3;
         assert!(third > 0);
@@ -465,6 +488,9 @@ fn streaming_render_soak() {
             percentiles(&times[times.len() - third..])
         );
         list.Close().unwrap();
+        if let Some((_, list)) = &prefix {
+            list.Close().unwrap();
+        }
         out.Unmap(0, None);
         CloseHandle(event).unwrap();
     }
