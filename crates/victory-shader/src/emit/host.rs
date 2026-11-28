@@ -1163,6 +1163,28 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_inner(root, pso, d, None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn timed_dispatch(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+    ) -> Result<(Vec<Vec<u32>>, f64), String> {
+        let mut ms = 0.0;
+        let out = self.dispatch_inner(root, pso, d, Some(&mut ms))?;
+        Ok((out, ms))
+    }
+
+    fn dispatch_inner(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        gpu_ms: Option<&mut f64>,
+    ) -> Result<Vec<Vec<u32>>, String> {
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
@@ -1529,6 +1551,24 @@ impl Host {
                     }
                     View::Buffer { data, stride } => {
                         let b = upload(data)?;
+                        let b = if gpu_ms.is_some() {
+                            let len = (data.len() * size_of::<u32>()) as u64;
+                            let local = make(
+                                D3D12_HEAP_TYPE_DEFAULT,
+                                &buffer(len, D3D12_RESOURCE_FLAG_NONE),
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                            )?;
+                            list.CopyBufferRegion(&local, 0, &b, 0, len);
+                            list.ResourceBarrier(&[transition(
+                                &local,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            )]);
+                            keep.push(b);
+                            local
+                        } else {
+                            b
+                        };
                         let (format, elements, stride, flags) = match stride {
                             Stride::Raw => (
                                 DXGI_FORMAT_R32_TYPELESS,
@@ -1611,7 +1651,30 @@ impl Host {
                 }
             }
             let [x, y, z] = d.groups;
+            let timer = if gpu_ms.is_some() {
+                let desc = D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                    Count: 2,
+                    NodeMask: 0,
+                };
+                let mut stamps: Option<ID3D12QueryHeap> = None;
+                dev.CreateQueryHeap(&desc, &mut stamps).map_err(err)?;
+                let stamps = stamps.ok_or("no timestamp heap")?;
+                let readback = make(
+                    D3D12_HEAP_TYPE_READBACK,
+                    &buffer(16, D3D12_RESOURCE_FLAG_NONE),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )?;
+                list.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                Some((stamps, readback))
+            } else {
+                None
+            };
             list.Dispatch(x, y, z);
+            if let Some((stamps, readback)) = &timer {
+                list.EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                list.ResolveQueryData(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, readback, 0);
+            }
             for (r, size, n, rb) in &uavs {
                 // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
@@ -1640,6 +1703,14 @@ impl Host {
                     return Err(format!("device removed: {}", err(e)));
                 }
                 std::thread::yield_now();
+            }
+            if let (Some(ms), Some((_, readback))) = (gpu_ms, timer) {
+                let frequency = queue.GetTimestampFrequency().map_err(err)?;
+                let mut p = std::ptr::null_mut();
+                readback.Map(0, None, Some(&mut p)).map_err(err)?;
+                let ticks = std::slice::from_raw_parts(p.cast::<u64>(), 2);
+                *ms = (ticks[1] - ticks[0]) as f64 * 1000.0 / frequency as f64;
+                readback.Unmap(0, None);
             }
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {

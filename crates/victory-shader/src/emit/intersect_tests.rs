@@ -456,7 +456,11 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
 /// The buffer for one batch: the threads' records, then the nodes. Node
 /// pointers count from `base` before the first node, in bytes.
 fn buffer(scene: &Scene, batch: &[Case], base: u64) -> Vec<u32> {
-    let mut data = vec![0u32; (NODES / 4) as usize];
+    let entries = batch
+        .len()
+        .max(THREADS as usize)
+        .next_multiple_of(THREADS as usize);
+    let mut data = vec![0u32; entries * (RECORD / 4) as usize];
     for (t, case) in batch.iter().enumerate() {
         let Some((n, kind, ray)) = case else { continue };
         let r = &mut data[t * (RECORD / 4) as usize..][..13];
@@ -472,6 +476,100 @@ fn buffer(scene: &Scene, batch: &[Case], base: u64) -> Vec<u32> {
     }
     data.extend(&scene.words);
     data
+}
+
+#[test]
+#[ignore = "GPU timestamps for synthetic BVH node tests"]
+fn benchmark_bvh_nodes() {
+    const GROUPS: u32 = 4096;
+    let count = GROUPS * THREADS;
+    let (scene, batches) = scene();
+    let cases: Vec<Case> = batches.into_iter().flatten().collect();
+    let workload = |kind: Option<u32>| {
+        let mut cases: Vec<Case> = cases
+            .iter()
+            .copied()
+            .filter(|case| match kind {
+                Some(kind) => {
+                    case.is_some_and(|(_, k, _)| if kind == 0 { k < 4 } else { k == kind })
+                }
+                None => true,
+            })
+            .collect();
+        if kind.is_none() {
+            // Share each wave between several node kinds in the mixed run.
+            let mut rng = Numbers(0xb7a1);
+            for i in (1..cases.len()).rev() {
+                let j = rng.next() as usize % (i + 1);
+                cases.swap(i, j);
+            }
+        }
+        cases
+            .into_iter()
+            .cycle()
+            .take(count as usize)
+            .collect::<Vec<_>>()
+    };
+    let mut code = vec![
+        0x8F06_8505, // s_lshl_b32 s6, s5, 5 (32 threads per group)
+        0x4A00_0006, // v_add_nc_u32 v0, s6, v0
+    ];
+    code.extend(program(true, Descriptor::Table));
+    let mut native = native(&code);
+    let StageIo::Cs(cs) = &mut native.io else {
+        unreachable!()
+    };
+    cs.rsrc2 |= 1 << 7; // group X in s5
+    let (shader, _) = build_compute_shader(&native).unwrap();
+    let host = Host::new(false).expect("SM 6.6 hardware adapter");
+    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    for (label, kind) in [
+        ("box16", Some(4)),
+        ("box32", Some(5)),
+        ("triangle", Some(0)),
+        ("mixed", None),
+    ] {
+        let cases = workload(kind);
+        let data = buffer(&scene, &cases, u64::from(count * RECORD));
+        let reference: Vec<u32> = cases
+            .iter()
+            .flat_map(|case| expected(&scene, case, true))
+            .collect();
+        let job = Dispatch {
+            roots: vec![(0, Root::Constants(vec![0; 5]))],
+            views: &[
+                View::Buffer {
+                    data: &data,
+                    stride: Stride::Raw,
+                },
+                View::RawUav(count * 4),
+            ],
+            samplers: &[],
+            groups: [GROUPS, 1, 1],
+        };
+        let mut gpu = Vec::new();
+        for i in 0..22 {
+            let (out, ms) = host.timed_dispatch(&root, &pso, &job).unwrap();
+            assert_eq!(out[0].len(), reference.len(), "{label}");
+            if let Some((word, (got, want))) = out[0]
+                .iter()
+                .zip(&reference)
+                .enumerate()
+                .find(|(_, (got, want))| got != want)
+            {
+                panic!("{label}, ray {}, word {}: {got:#010x} != {want:#010x}", word / 4, word % 4);
+            }
+            if i >= 2 {
+                gpu.push(ms);
+            }
+        }
+        gpu.sort_unstable_by(f64::total_cmp);
+        println!(
+            "bvh {label} rays={count} p50={:.6}ms p95={:.6}ms",
+            (gpu[9] + gpu[10]) / 2.0,
+            gpu[18]
+        );
+    }
 }
 
 fn expected(scene: &Scene, case: &Case, sort: bool) -> [u32; 4] {
